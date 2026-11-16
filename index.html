@@ -2179,6 +2179,7 @@
       var dash2El = document.getElementById('dash-2');
 
       var frameStore = new Array(TOTAL_FRAMES); // { blob, leftEdge, rightEdge }
+      var anchorBitmaps = new Map(); // permanent ImageBitmaps for every 4th frame (0, 4, 8, ... 240)
       var bitmapCache = new Map(); // index -> ImageBitmap (LRU order via Map insertion)
       var decodingSet = new Set();
       var sceneActivated = false;
@@ -2193,8 +2194,13 @@
         if (!canvas || !useVideoScene) return;
         var rect = canvas.parentElement.getBoundingClientRect();
         var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-        var w = Math.max(1, Math.round(rect.width * dpr));
-        var h = Math.max(1, Math.round(rect.height * dpr));
+        var rawW = Math.max(1, rect.width * dpr);
+        var rawH = Math.max(1, rect.height * dpr);
+        // Cap backing store to 1080p max dimension on tall/high-DPR viewports to prevent GPU fill-rate stalls
+        var maxDim = 1440;
+        var scale = Math.min(1, maxDim / Math.max(rawW, rawH));
+        var w = Math.max(1, Math.round(rawW * scale));
+        var h = Math.max(1, Math.round(rawH * scale));
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
@@ -2204,12 +2210,35 @@
 
       window.addEventListener('resize', sizeSceneCanvas, { passive: true });
 
+      function getCachedBitmap(idx) {
+        if (anchorBitmaps.has(idx)) {
+          return anchorBitmaps.get(idx);
+        }
+        if (bitmapCache.has(idx)) {
+          var bmp = bitmapCache.get(idx);
+          bitmapCache.delete(idx);
+          bitmapCache.set(idx, bmp);
+          return bmp;
+        }
+        return null;
+      }
+
+      function hasCachedBitmap(idx) {
+        return anchorBitmaps.has(idx) || bitmapCache.has(idx);
+      }
+
       function touchBitmap(idx, bmp) {
+        if (idx % 4 === 0) {
+          if (!anchorBitmaps.has(idx)) {
+            anchorBitmaps.set(idx, bmp);
+          }
+          return;
+        }
         if (bitmapCache.has(idx)) {
           bitmapCache.delete(idx);
         }
         bitmapCache.set(idx, bmp);
-        while (bitmapCache.size > 56) {
+        while (bitmapCache.size > 96) {
           var oldestKey = bitmapCache.keys().next().value;
           var oldBmp = bitmapCache.get(oldestKey);
           bitmapCache.delete(oldestKey);
@@ -2219,10 +2248,11 @@
         }
       }
 
-      function decodeBlobToBitmap(idx) {
+      function decodeBlobToBitmap(idx, highPriority) {
         if (idx < 0 || idx >= TOTAL_FRAMES) return;
-        if (bitmapCache.has(idx) || decodingSet.has(idx)) return;
-        if (decodingSet.size >= 8) return;
+        if (hasCachedBitmap(idx) || decodingSet.has(idx)) return;
+        var limit = highPriority ? 14 : 8;
+        if (decodingSet.size >= limit) return;
         var entry = frameStore[idx];
         if (!entry || !entry.blob) return;
 
@@ -2239,34 +2269,38 @@
       }
 
       function queueWindowBitmaps() {
-        var low = Math.floor(Math.min(curFrame, targetFrame)) - 4;
-        var high = Math.ceil(Math.max(curFrame, targetFrame)) + 14;
-        var center = Math.round(curFrame);
+        var low = Math.max(0, Math.floor(Math.min(curFrame, targetFrame)) - 6);
+        var high = Math.min(TOTAL_FRAMES - 1, Math.ceil(Math.max(curFrame, targetFrame)) + 16);
+        var center = clamp(Math.round(curFrame), 0, TOTAL_FRAMES - 1);
+        var targetRound = clamp(Math.round(targetFrame), 0, TOTAL_FRAMES - 1);
 
-        // Prioritize frames closest to current playhead first
-        decodeBlobToBitmap(center);
-        decodeBlobToBitmap(center + 1);
+        // Always prioritize exact playhead and target frames
+        decodeBlobToBitmap(center, true);
+        decodeBlobToBitmap(center + 1, true);
+        decodeBlobToBitmap(targetRound, true);
+
         for (var offset = 1; offset <= high - low; offset++) {
           if (decodingSet.size >= 8) break;
           var fwd = center + offset;
           var bwd = center - offset;
-          if (fwd <= high) decodeBlobToBitmap(fwd);
-          if (bwd >= low) decodeBlobToBitmap(bwd);
+          if (fwd <= high) decodeBlobToBitmap(fwd, false);
+          if (bwd >= low) decodeBlobToBitmap(bwd, false);
         }
       }
 
       function getNearestBitmap(targetIdx) {
-        if (bitmapCache.has(targetIdx)) {
-          var exact = bitmapCache.get(targetIdx);
-          touchBitmap(targetIdx, exact);
+        var exact = getCachedBitmap(targetIdx);
+        if (exact) {
           return { bmp: exact, idx: targetIdx };
         }
-        for (var d = 1; d <= 12; d++) {
-          if (bitmapCache.has(targetIdx - d)) {
-            return { bmp: bitmapCache.get(targetIdx - d), idx: targetIdx - d };
+        for (var d = 1; d < TOTAL_FRAMES; d++) {
+          var prevIdx = targetIdx - d;
+          if (prevIdx >= 0 && hasCachedBitmap(prevIdx)) {
+            return { bmp: getCachedBitmap(prevIdx), idx: prevIdx };
           }
-          if (bitmapCache.has(targetIdx + d)) {
-            return { bmp: bitmapCache.get(targetIdx + d), idx: targetIdx + d };
+          var nextIdx = targetIdx + d;
+          if (nextIdx < TOTAL_FRAMES && hasCachedBitmap(nextIdx)) {
+            return { bmp: getCachedBitmap(nextIdx), idx: nextIdx };
           }
         }
         return null;
@@ -2284,17 +2318,20 @@
         var fracRounded = Math.round(frac * 100) / 100;
         var tRounded = Math.round(t * 1000) / 1000;
 
+        var primary = getNearestBitmap(baseIdx);
+        if (!primary) return;
+
+        var canBlendNext = fracRounded > 0.01 && nextIdx !== baseIdx && primary.idx === baseIdx && hasCachedBitmap(nextIdx);
+        var effectiveFrac = canBlendNext ? fracRounded : 0;
+
         if (
           !canvasNeedsRedraw &&
-          baseIdx === lastDrawnIdx &&
-          fracRounded === lastDrawnFrac &&
+          primary.idx === lastDrawnIdx &&
+          effectiveFrac === lastDrawnFrac &&
           tRounded === lastDrawnT
         ) {
           return;
         }
-
-        var primary = getNearestBitmap(baseIdx);
-        if (!primary) return;
 
         var W = canvas.width;
         var H = canvas.height;
@@ -2332,15 +2369,14 @@
         // Draw primary frame
         ctx.drawImage(primary.bmp, rx, ry, rw, rh);
 
-        var didBlendNext = false;
         // Sub-frame blend
-        if (fracRounded > 0.01 && nextIdx !== baseIdx && bitmapCache.has(nextIdx)) {
-          var nextBmp = bitmapCache.get(nextIdx);
-          touchBitmap(nextIdx, nextBmp);
-          ctx.globalAlpha = fracRounded;
-          ctx.drawImage(nextBmp, rx, ry, rw, rh);
-          ctx.globalAlpha = 1;
-          didBlendNext = true;
+        if (canBlendNext) {
+          var nextBmp = getCachedBitmap(nextIdx);
+          if (nextBmp) {
+            ctx.globalAlpha = fracRounded;
+            ctx.drawImage(nextBmp, rx, ry, rw, rh);
+            ctx.globalAlpha = 1;
+          }
         }
 
         // Feather edges over 6% of frame width where frame doesn't reach side
@@ -2361,14 +2397,10 @@
           ctx.fillRect(rightEdgeX - featherW - 2, ry, featherW + 4, rh);
         }
 
-        var exactFrameDrawn =
-          primary.idx === baseIdx &&
-          (fracRounded <= 0.01 || nextIdx === baseIdx || didBlendNext);
-
-        lastDrawnIdx = exactFrameDrawn ? baseIdx : -1;
-        lastDrawnFrac = fracRounded;
+        lastDrawnIdx = primary.idx;
+        lastDrawnFrac = effectiveFrac;
         lastDrawnT = tRounded;
-        canvasNeedsRedraw = !exactFrameDrawn;
+        canvasNeedsRedraw = false;
       }
 
       function onFrameStored(index, blob, leftEdge, rightEdge) {
@@ -2394,9 +2426,13 @@
           return;
         }
 
-        if (Math.abs(index - curFrame) <= 18 || Math.abs(index - targetFrame) <= 18) {
-          decodeBlobToBitmap(index);
-          canvasNeedsRedraw = true;
+        // Pre-decode anchor frames (every 4th frame) + frames near current/target playhead
+        if (
+          index % 4 === 0 ||
+          Math.abs(index - curFrame) <= 18 ||
+          Math.abs(index - targetFrame) <= 18
+        ) {
+          decodeBlobToBitmap(index, Math.abs(index - curFrame) <= 2);
         }
       }
 
@@ -2472,15 +2508,10 @@
         var workerCount = clamp((navigator.hardwareConcurrency || 4) - 1, 1, 4);
         var workerCode = [
           'let canvas = null, ctx = null, w = 0, h = 0;',
+          'const edgeCanvas = new OffscreenCanvas(8, 16);',
+          'const edgeCtx = edgeCanvas.getContext("2d", { willReadFrequently: true });',
           'const queue = [];',
           'let busy = false;',
-          'function avgCols(data) {',
-          '  let r = 0, g = 0, b = 0, n = data.length / 4;',
-          '  for (let i = 0; i < data.length; i += 4) {',
-          '    r += data[i]; g += data[i+1]; b += data[i+2];',
-          '  }',
-          '  return "rgb(" + Math.round(r/n) + "," + Math.round(g/n) + "," + Math.round(b/n) + ")";',
-          '}',
           'async function next() {',
           '  if (busy || queue.length === 0) return;',
           '  busy = true;',
@@ -2492,13 +2523,22 @@
           '    if (!canvas || w !== fw || h !== fh) {',
           '      w = fw; h = fh;',
           '      canvas = new OffscreenCanvas(w, h);',
-          '      ctx = canvas.getContext("2d", { willReadFrequently: true });',
+          '      ctx = canvas.getContext("2d");',
           '    }',
           '    ctx.drawImage(frame, 0, 0);',
+          '    edgeCtx.drawImage(frame, 0, 0, 8, 16);',
           '    frame.close();',
-          '    const leftEdge = avgCols(ctx.getImageData(0, 0, 4, h).data);',
-          '    const rightEdge = avgCols(ctx.getImageData(w - 4, 0, 4, h).data);',
-          '    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.88 });',
+          '    const ed = edgeCtx.getImageData(0, 0, 8, 16).data;',
+          '    let lr = 0, lg = 0, lb = 0, rr = 0, rg = 0, rb = 0;',
+          '    for (let y = 0; y < 16; y++) {',
+          '      const li = (y * 8 + 0) * 4;',
+          '      const ri = (y * 8 + 7) * 4;',
+          '      lr += ed[li]; lg += ed[li+1]; lb += ed[li+2];',
+          '      rr += ed[ri]; rg += ed[ri+1]; rb += ed[ri+2];',
+          '    }',
+          '    const leftEdge = "rgb(" + Math.round(lr/16) + "," + Math.round(lg/16) + "," + Math.round(lb/16) + ")";',
+          '    const rightEdge = "rgb(" + Math.round(rr/16) + "," + Math.round(rg/16) + "," + Math.round(rb/16) + ")";',
+          '    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.85 });',
           '    self.postMessage({ index: job.index, time: job.time, blob, leftEdge, rightEdge });',
           '  } catch (e) {',
           '    try { frame.close(); } catch (_) {}',
@@ -2524,10 +2564,12 @@
         var streamEnded = false;
         var flushed = false;
         var decoder = null;
+        var decoderReady = false;
+        var pendingStreamResume = null;
         var failed = false;
 
         function pumpSamples() {
-          if (failed || !decoder || decoder.state !== 'configured') return;
+          if (failed || !decoder || !decoderReady || decoder.state !== 'configured') return;
           while (
             sampleQueue.length > 0 &&
             decoder.decodeQueueSize < 4 &&
@@ -2602,6 +2644,10 @@
             }
           }
 
+          // Start MP4 sample extraction immediately so samples queue in sampleQueue
+          mp4boxfile.setExtractionOptions(vTrack.id, null, { nbSamples: 12 });
+          mp4boxfile.start();
+
           decoder = new VideoDecoder({
             output: function (videoFrame) {
               var idx = decodedFrameIdx++;
@@ -2637,22 +2683,36 @@
             hardwareAcceleration: 'prefer-software'
           };
 
-          try {
-            decoder.configure(config);
-          } catch (_) {
-            try {
-              config.hardwareAcceleration = 'no-preference';
+          VideoDecoder.isConfigSupported(config)
+            .then(function (support) {
+              if (!support || !support.supported) {
+                config.hardwareAcceleration = 'no-preference';
+              }
               decoder.configure(config);
-            } catch (_e2) {
-              failed = true;
-              startFallbackVideoCapture();
-              return;
-            }
-          }
-
-          mp4boxfile.setExtractionOptions(vTrack.id, null, { nbSamples: 12 });
-          mp4boxfile.start();
-          pumpSamples();
+              decoderReady = true;
+              pumpSamples();
+              if (pendingStreamResume) {
+                var resume = pendingStreamResume;
+                pendingStreamResume = null;
+                resume();
+              }
+            })
+            .catch(function () {
+              try {
+                config.hardwareAcceleration = 'no-preference';
+                decoder.configure(config);
+                decoderReady = true;
+                pumpSamples();
+                if (pendingStreamResume) {
+                  var resume = pendingStreamResume;
+                  pendingStreamResume = null;
+                  resume();
+                }
+              } catch (_) {
+                failed = true;
+                startFallbackVideoCapture();
+              }
+            });
         };
 
         mp4boxfile.onSamples = function (id, _user, samples) {
@@ -2672,9 +2732,16 @@
             function readChunk() {
               reader.read().then(function (result) {
                 if (result.done) {
-                  streamEnded = true;
-                  mp4boxfile.flush();
-                  pumpSamples();
+                  var finishStream = function () {
+                    streamEnded = true;
+                    mp4boxfile.flush();
+                    pumpSamples();
+                  };
+                  if (decoderReady) {
+                    finishStream();
+                  } else {
+                    pendingStreamResume = finishStream;
+                  }
                   return;
                 }
                 var buf = result.value.buffer.slice(
@@ -2684,7 +2751,11 @@
                 buf.fileStart = offset;
                 offset += buf.byteLength;
                 mp4boxfile.appendBuffer(buf);
-                readChunk();
+                if (decoderReady) {
+                  readChunk();
+                } else {
+                  pendingStreamResume = readChunk;
+                }
               }).catch(function () {
                 if (!sceneActivated && !failed) {
                   failed = true;
